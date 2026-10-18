@@ -1,12 +1,52 @@
 import os
 
 import psycopg
+from time import perf_counter
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from psycopg.rows import dict_row
 from pydantic import BaseModel, Field
+from prometheus_client import (
+    Counter,
+    Gauge,
+    Histogram,
+    CONTENT_TYPE_LATEST,
+    generate_latest,
+)
 
 app = FastAPI()
+
+TASK_LIST_REQUESTS = Counter(
+    "task_list_requests_total",
+    "Number of completed calls to the task list handler",
+    ["outcome"],
+)
+
+TASK_LIST_IN_PROGRESS = Gauge(
+    "task_list_in_progress",
+    "Number of task list handlers currently executing",
+)
+
+TASK_LIST_DURATION = Histogram(
+    "task_list_duration_seconds",
+    "Time spent executing the task list handler",
+    buckets=(
+        0.005,
+        0.01,
+        0.015,
+        0.02,
+        0.03,
+        0.05,
+        0.1,
+        0.5,
+        1,
+        2,
+        5,
+    ),
+)
+
+TASK_LIST_REQUESTS.labels(outcome="success")
+TASK_LIST_REQUESTS.labels(outcome="error")
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
@@ -83,14 +123,27 @@ def create_task(task: TaskCreate):
 
 @app.get("/tasks", response_model=list[TaskResponse])
 def list_tasks():
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "SELECT id, title, completed FROM tasks ORDER BY id"
-            )
-            tasks = cursor.fetchall()
+    started_at = perf_counter()
+    outcome = "error"
+    TASK_LIST_IN_PROGRESS.inc()
 
-    return tasks
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id, title, completed FROM tasks ORDER BY id"
+                )
+                tasks = cursor.fetchall()
+
+        outcome = "success"
+        return tasks
+
+    finally:
+        duration = perf_counter() - started_at
+        TASK_LIST_DURATION.observe(duration)
+
+        TASK_LIST_IN_PROGRESS.dec()
+        TASK_LIST_REQUESTS.labels(outcome=outcome).inc()
 
 
 @app.patch("/tasks/{task_id}", response_model=TaskResponse)
@@ -134,3 +187,10 @@ def delete_task(task_id: int) -> Response:
                 )
 
     return Response(status_code=204)
+
+@app.get("/metrics")
+def metrics():
+    return Response(
+        content=generate_latest(),
+        headers={"Content-Type": CONTENT_TYPE_LATEST},
+    )

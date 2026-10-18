@@ -1,0 +1,83 @@
+groups:
+  - name: task-api-availability
+    rules:
+      - alert: TaskApiScrapeDown
+        expr: up{job="task-api"} == 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Не удаётся собрать метрики Task API"
+          description: "Target {{ $labels.instance }} недоступен для сбора метрик не менее 30 секунд."
+      - alert: TaskApiHighErrorRate
+        expr: |
+          (
+            sum by (job) (
+              rate(task_list_requests_total{
+                job="task-api", outcome="error"
+              }[1m])
+            )
+            /
+            sum by (job) (
+              rate(task_list_requests_total{
+                job="task-api", outcome=~"success|error"
+              }[1m])
+            )
+          ) > 0.2
+          and on (job)
+          (
+            sum by (job) (
+              rate(task_list_requests_total{
+                job="task-api", outcome=~"success|error"
+              }[1m])
+            )
+          ) > 1
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокая доля ошибок Task API"
+          description: "Доля ошибок выше 20% при трафике более 1 запроса/с не менее 30 секунд."
+      - alert: TaskApiHighLatency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (job, le) (
+              rate(task_list_duration_seconds_bucket{
+                job="task-api"
+              }[1m])
+            )
+          ) > 0.5
+          and on (job)
+          (
+            sum by (job) (
+              rate(task_list_duration_seconds_count{
+                job="task-api"
+              }[1m])
+            )
+          ) > 1
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Высокая задержка Task API"
+          description: "Оценка p95 длительности обработчика выше 0,5 секунды при трафике более 1 запроса/с не менее 30 секунд."
+  - name: routing-demo
+    rules:
+      - alert: LabHighLatency
+        expr: vector(0) == 1
+        labels:
+          job: routing-demo
+          severity: warning
+
+      - alert: LabHighErrors
+        expr: vector(0) == 1
+        labels:
+          job: routing-demo
+          severity: warning
+
+      - alert: LabServiceDown
+        expr: vector(0) == 1
+        labels:
+          job: routing-demo
+          severity: critical

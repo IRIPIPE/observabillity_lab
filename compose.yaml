@@ -1,0 +1,99 @@
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8001:8000"
+    environment:
+      DATABASE_URL: "postgresql://obs_user:obs_dev_password@db:5432/tasks"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: obs_user
+      POSTGRES_PASSWORD: obs_dev_password
+      POSTGRES_DB: tasks
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "obs_user", "-d", "tasks"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/observability-lab.yml:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  alertmanager:
+    image: prom/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+
+  webhook:
+    image: python:3.12-slim
+    command: ["python", "-u", "/app/webhook.py"]
+    volumes:
+      - ./webhook.py:/app/webhook.py:ro
+
+  node-exporter:
+    image: quay.io/prometheus/node-exporter
+    network_mode: host
+    pid: host
+    command:
+      - "--path.rootfs=/host"
+    volumes:
+      - /:/host:ro,rslave
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:0.60.6
+    privileged: true
+    cgroup: host
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: ["tools"]
+    volumes:
+      - ./tests/load:/scripts:ro
+
+volumes:
+  pgdata:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:

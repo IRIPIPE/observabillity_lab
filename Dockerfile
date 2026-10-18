@@ -4,7 +4,7 @@ WORKDIR /app
 
 COPY requirements.txt constraints.txt ./
 
-RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt  
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
 RUN groupadd --gid 10001 appuser \
     && useradd --uid 10001 --gid appuser --create-home appuser

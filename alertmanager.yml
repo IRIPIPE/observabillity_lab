@@ -1,0 +1,39 @@
+route:
+  receiver: lab
+  group_by: ["alertname", "job"]
+  group_wait: 10s
+  group_interval: 30s
+  repeat_interval: 1h
+
+  routes:
+    - matchers:
+        - 'job="routing-demo"'
+        - 'severity="critical"'
+      receiver: lab-critical
+      group_by: ["job"]
+
+    - matchers:
+        - 'job="routing-demo"'
+      receiver: lab
+      group_by: ["job"]
+
+receivers:
+  - name: lab
+    webhook_configs:
+      - url: http://webhook:8080/
+        send_resolved: true
+
+  - name: lab-critical
+    webhook_configs:
+      - url: http://webhook:8080/
+        send_resolved: true
+
+inhibit_rules:
+  - source_matchers:
+      - 'job="routing-demo"'
+      - 'alertname="LabServiceDown"'
+      - 'severity="critical"'
+    target_matchers:
+      - 'job="routing-demo"'
+      - 'severity="warning"'
+    equal: ["job"]
