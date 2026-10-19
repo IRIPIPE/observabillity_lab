@@ -5,6 +5,7 @@ services:
       - "127.0.0.1:8001:8000"
     environment:
       DATABASE_URL: "postgresql://obs_user:obs_dev_password@db:5432/tasks"
+      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://alloy:4318/v1/traces"
     depends_on:
       db:
         condition: service_healthy
@@ -92,8 +93,45 @@ services:
     volumes:
       - ./tests/load:/scripts:ro
 
+  loki:
+    image: grafana/loki:3.7.8
+    command: ["-config.file=/etc/loki/config.yml"]
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./loki/config.yml:/etc/loki/config.yml:ro
+      - loki-data:/loki
+
+  alloy:
+    image: grafana/alloy:v1.21.0
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - --storage.path=/var/lib/alloy/data
+      - /etc/alloy/config.alloy
+    ports:
+      - "127.0.0.1:12345:12345"
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+
+  tempo:
+    image: grafana/tempo:3.1.0
+    command:
+      - "-config.file=/etc/tempo/config.yml"
+      - "-target=all"
+    ports:
+      - "127.0.0.1:3200:3200"
+    volumes:
+      - ./tempo/config.yml:/etc/tempo/config.yml:ro
+      - tempo-data:/var/tempo
+
 volumes:
   pgdata:
   prometheus-data:
   grafana-data:
   alertmanager-data:
+  loki-data:
+  alloy-data:
+  tempo-data:

@@ -1,6 +1,19 @@
 import os
 
 import psycopg
+import json
+import logging
+import sys
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+    OTLPSpanExporter,
+)
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from datetime import datetime, timezone
+from uuid import uuid4
 from time import perf_counter
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
@@ -15,6 +28,44 @@ from prometheus_client import (
 )
 
 app = FastAPI()
+
+resource = Resource.create(
+    {
+        "service.name": "task-api",
+        "deployment.environment.name": "lab",
+    }
+)
+
+tracer_provider = TracerProvider(resource=resource)
+
+exporter = OTLPSpanExporter(
+    endpoint=os.environ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"]
+)
+
+tracer_provider.add_span_processor(
+    BatchSpanProcessor(exporter)
+)
+
+trace.set_tracer_provider(tracer_provider)
+tracer = trace.get_tracer("task-api")
+def trace_context_fields():
+    context = trace.get_current_span().get_span_context()
+
+    if not context.is_valid:
+        return {}
+
+    return {
+        "trace_id": f"{context.trace_id:032x}",
+        "span_id": f"{context.span_id:016x}",
+    }
+
+logger = logging.getLogger("task_api")
+logger.setLevel(logging.INFO)
+logger.propagate = False
+
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(handler)
 
 TASK_LIST_REQUESTS = Counter(
     "task_list_requests_total",
@@ -64,6 +115,26 @@ async def database_error_handler(
     request: Request,
     exc: psycopg.OperationalError,
 ):
+    logger.error(
+        json.dumps(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": "ERROR",
+                "service": "task-api",
+                "event": "database_error",
+                "method": request.method,
+                "path": request.url.path,
+                "request_id": getattr(
+                    request.state, "request_id", None
+                ),
+                **trace_context_fields(),
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            },
+            ensure_ascii=False,
+        )
+    )
+
     return JSONResponse(
         status_code=503,
         content={"detail": "Database unavailable"},
@@ -128,12 +199,28 @@ def list_tasks():
     TASK_LIST_IN_PROGRESS.inc()
 
     try:
-        with get_connection() as conn:
+        with tracer.start_as_current_span(
+            "db.connect",
+            kind=trace.SpanKind.CLIENT,
+            attributes={"db.system.name": "postgresql"},
+        ):
+            connection = get_connection()
+
+        with connection as conn:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT id, title, completed FROM tasks ORDER BY id"
-                )
-                tasks = cursor.fetchall()
+                with tracer.start_as_current_span(
+                    "db.query.tasks",
+                    kind=trace.SpanKind.CLIENT,
+                    attributes={
+                        "db.system.name": "postgresql",
+                        "db.operation.name": "SELECT",
+                    },
+                ):
+                    cursor.execute(
+                        "SELECT id, title, completed "
+                        "FROM tasks ORDER BY id"
+                    )
+                    tasks = cursor.fetchall()
 
         outcome = "success"
         return tasks
@@ -194,3 +281,54 @@ def metrics():
         content=generate_latest(),
         headers={"Content-Type": CONTENT_TYPE_LATEST},
     )
+
+@app.middleware("http")
+async def log_http_request(request: Request, call_next):
+    if request.url.path in {"/metrics", "/health"}:
+        return await call_next(request)
+
+    started_at = perf_counter()
+    request_id = uuid4().hex
+    request.state.request_id = request_id
+    status_code = 500
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    finally:
+        duration_ms = (perf_counter() - started_at) * 1000
+
+        level = (
+            logging.ERROR if status_code >= 500
+            else logging.WARNING if status_code >= 400
+            else logging.INFO
+        )
+
+        logger.log(
+            level,
+            json.dumps(
+                {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "level": logging.getLevelName(level),
+                    "service": "task-api",
+                    "event": "http_request",
+                    "method": request.method,
+                    "path": request.url.path,
+                    "status_code": status_code,
+                    "duration_ms": round(duration_ms, 3),
+                    "request_id": request_id,
+                    **trace_context_fields(),
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+FastAPIInstrumentor.instrument_app(
+    app,
+    tracer_provider=tracer_provider,
+    excluded_urls="/metrics,/health",
+    exclude_spans=["receive", "send"],
+)

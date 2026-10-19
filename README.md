@@ -1,28 +1,37 @@
 # Observability Lab
 
 Учебный стенд наблюдаемости на Docker Compose: FastAPI и PostgreSQL,
-метрики приложения, хоста и контейнеров, дашборд Grafana,
+метрики приложения, хоста и контейнеров, JSON-логи в Loki,
+tracing через OpenTelemetry и Tempo, дашборд Grafana,
 алерты Prometheus и доставка уведомлений через Alertmanager в локальный webhook.
 
 Проект позволяет воспроизвести недоступность API, ошибки подключения к БД
 и медленные запросы, затем обнаружить их по метрикам и уведомлениям.
+Для отдельного запроса можно найти причину ошибки в логах, перейти к trace
+и увидеть время подключения к БД и выполнения SQL. Отдельный клиент
+демонстрирует передачу контекста трассировки через HTTP.
 
 ## Архитектура
 
 ```text
-k6 / curl → FastAPI → PostgreSQL
-                ↑
-          scrape /metrics
-                │
-Node Exporter ← Prometheus → Alertmanager → webhook → Docker logs
-    (хост)      ↑     ↑
-                │     └── Grafana запрашивает PromQL
-          cAdvisor
-        (контейнеры)
+k6 / curl / lab-client → FastAPI → PostgreSQL
+
+Метрики: API /metrics, Node Exporter, cAdvisor
+                        ↓ scrape
+                    Prometheus → Alertmanager → webhook
+
+Логи:    API stdout/stderr → Docker API → Alloy → Loki
+Traces:  API / lab-client ── OTLP/HTTP ──→ Alloy ── OTLP/gRPC ──→ Tempo
+
+Grafana запрашивает Prometheus, Loki и Tempo.
+Переходы между логами и traces связаны через trace_id.
 ```
 
 Prometheus опрашивает targets и оценивает правила каждые 5 секунд.
-Grafana автоматически получает источник Prometheus и дашборд из файлов.
+Grafana автоматически получает источники Prometheus, Loki, Tempo и дашборд
+из файлов. Alloy собирает логи сервиса `api` по Docker labels проекта
+`observability-lab`. Для traces он слушает `alloy:4318` и отправляет их
+в `tempo:4317`; оба порта используются внутри Compose-сети.
 PostgreSQL exporter в эту версию проекта не входит.
 
 ## Требования
@@ -30,7 +39,8 @@ PostgreSQL exporter в эту версию проекта не входит.
 - Linux-хост с Docker Engine, Compose и Buildx. Стенд проверен на Arch Linux,
   x86_64, с системным Docker daemon.
 - Доступ к Docker от текущего пользователя.
-- Свободные локальные порты 8001, 3000, 9090, 9093 и порт хоста 9100.
+- Свободные локальные порты 8001, 3000, 9090, 9093, 3100, 3200, 12345
+  и порт хоста 9100.
 
 Node Exporter использует `network_mode: host`, `pid: host` и чтение файловой
 системы хоста. Он слушает 9100 на интерфейсах хоста. Prometheus обращается
@@ -38,6 +48,8 @@ Node Exporter использует `network_mode: host`, `pid: host` и чтен
 cAdvisor использует расширенные права и подключения каталогов хоста.
 В Compose указан стандартный Docker Root Dir `/var/lib/docker`;
 при другом расположении нужно изменить источник соответствующего bind mount.
+Alloy получает доступ к Docker API через `/var/run/docker.sock`.
+Монтирование сокета с `:ro` не ограничивает методы самого Docker API.
 
 Проверить расположение данных Docker:
 
@@ -52,13 +64,18 @@ exporters к хосту.
 
 ## Запуск
 
-Из корня репозитория:
+Из корня репозитория в каталоге `observability-lab`:
 
 ```bash
 docker compose config --quiet
 docker compose up -d --build
 docker compose ps
 ```
+
+Имя Compose-проекта важно для фильтра контейнеров в `alloy/config.alloy`.
+При другом имени каталога нужно либо изменить фильтр
+`com.docker.compose.project`, либо использовать `docker compose -p observability-lab`
+во всех командах вместо `docker compose`.
 
 Сервис `k6` имеет профиль `tools` и не запускается обычным `up`.
 Тома Compose создаются автоматически. При пустом томе БД `schema.sql`
@@ -75,6 +92,9 @@ docker compose ps
 | Дашборд Task API | [Task API](http://localhost:3000/d/adm9j7w) |
 | Alertmanager | [localhost:9093](http://localhost:9093) |
 | Node Exporter | [localhost:9100/metrics](http://localhost:9100/metrics) |
+| Loki readiness | [localhost:3100/ready](http://localhost:3100/ready) |
+| Tempo readiness | [localhost:3200/ready](http://localhost:3200/ready) |
+| Интерфейс Alloy | [localhost:12345](http://localhost:12345) |
 
 При первом запуске Grafana логин и пароль — `admin` / `admin`;
 после входа установить свой пароль. При сохранённом томе используется
@@ -86,7 +106,13 @@ docker compose ps
 curl -i http://localhost:8001/health/db
 curl -i http://localhost:8001/tasks
 curl -s http://localhost:8001/metrics
+curl -i http://localhost:3100/ready
+curl -i http://localhost:3200/ready
 ```
+
+Для readiness Loki и Tempo ожидается HTTP 200 после завершения запуска.
+Это проверка готовности компонентов; доставку логов и traces проверять
+отдельным запросом к API и поиском в Grafana Explore.
 
 На странице Targets должны быть доступны jobs `task-api`, `node`, `cadvisor`.
 Состояние `up=1` означает успешный scrape, но не подтверждает работоспособность БД.
@@ -136,13 +162,222 @@ histogram_quantile(0.95,
 Без наблюдений доля ошибок и длительность могут возвращать `NaN`.
 Перцентиль Histogram — оценка по корзинам, а не точное измерение отдельных запросов.
 
+## Логи: Alloy и Loki
+
+API пишет JSON-события в stdout. Alloy находит контейнер через Docker API,
+читает его логи и отправляет в Loki. Конфигурации:
+
+- `alloy/config.alloy` — обнаружение контейнера, чтение и отправка логов;
+- `loki/config.yml` — файловое хранилище, схема TSDB v13 и retention;
+- `app/main.py` — HTTP middleware и логирование ошибок PostgreSQL.
+
+Два прикладных типа событий:
+
+| Событие | Поля и назначение |
+|---|---|
+| `http_request` | Метод, путь, HTTP-статус, `duration_ms`, `request_id`; результат обращения |
+| `database_error` | Тип и сообщение исключения, `request_id`; причина ошибки подключения |
+
+Если есть активный контекст OpenTelemetry, в запись добавляются `trace_id`
+и `span_id`. `request_id` также возвращается клиенту в заголовке `X-Request-ID`.
+Для одного сбоя БД появляются две ERROR-записи, описывающие один HTTP-запрос.
+При подсчёте ошибочных запросов нужно фильтровать `event="http_request"`.
+
+`duration_ms` измеряется до получения ответа от обработчика, без полной
+передачи тела клиенту. JSON middleware пропускает `/metrics` и `/health`.
+Стандартные текстовые access logs Uvicorn продолжают собираться вместе с JSON.
+
+Индексируемые labels логов: `service_name="task-api"`, `environment="lab"`.
+Идентификаторы запросов, HTTP-статус и длительность остаются полями JSON.
+`request_id` и `trace_id` не используются как индексируемые labels:
+уникальные значения создавали бы отдельные потоки и высокую кардинальность.
+Поля, извлечённые через `| json` при поиске, не меняют хранимые потоки.
+
+### Поиск в Grafana Explore
+
+Выбрать источник **Loki**, режим **Code** и интервал, содержащий запрос.
+Все JSON-записи API:
+
+```logql
+{service_name="task-api", environment="lab"}
+| json
+| __error__=""
+```
+
+`__error__=""` исключает ошибки разбора, например текстовые строки Uvicorn.
+Это не фильтр HTTP-ошибок приложения.
+
+Неуспешные HTTP-запросы:
+
+```logql
+{service_name="task-api", environment="lab"}
+| json
+| event="http_request"
+| status_code >= 500
+| __error__=""
+```
+
+Медленные обращения, более 20 миллисекунд:
+
+```logql
+{service_name="task-api", environment="lab"}
+| json
+| event="http_request"
+| duration_ms > 20
+| __error__=""
+```
+
+Связанные записи одного запроса — подставить ID из заголовка ответа:
+
+```logql
+{service_name="task-api", environment="lab"}
+| json
+| __error__=""
+| request_id="ВСТАВЬ_REQUEST_ID"
+```
+
+Для поиска всего trace можно заменить последний фильтр на `trace_id="ВСТАВЬ_TRACE_ID"`.
+
+### График HTTP 5xx из логов
+
+Панель Time series с источником Loki:
+
+```logql
+sum(
+  count_over_time(
+    {service_name="task-api", environment="lab"}
+    | json
+    | event="http_request"
+    | status_code >= 500
+    | __error__=""
+    [1m]
+  )
+)
+```
+
+Каждая точка показывает число подходящих записей за предшествующую минуту,
+а не RPS. Окно скользящее; одна ошибка может участвовать в соседних точках.
+Отсутствие подходящих записей может отображаться как пропуск и само по себе
+не доказывает исправность API или сборщика. Запрос проверен в UI; текущий
+JSON-экспорт дашборда ещё не содержит эту панель.
+
+### Хранение и проверка конфигурации
+
+В Loki включён Compactor retention: `retention_period: 168h` (7 дней),
+`compaction_interval: 10m`, `retention_delete_delay: 2h`.
+Очистка асинхронная, а рабочие файлы Compactor находятся в томе `loki-data`.
+`schema_config.index.period: 24h` задаёт период индекса, а не срок хранения.
+Retention Loki не управляет исходными Docker-логами контейнеров.
+Конфигурация проверена и загружена; удаление данных по истечении семи дней
+отдельным длительным экспериментом не проверялось.
+
+```bash
+docker compose run --rm --no-deps loki \
+  -config.file=/etc/loki/config.yml -verify-config=true
+docker compose run --rm --no-deps alloy validate /etc/alloy/config.alloy
+```
+
+После изменения соответствующего файла:
+
+```bash
+docker compose restart loki alloy
+```
+
+## Tracing: OpenTelemetry, Alloy и Tempo
+
+OpenTelemetry SDK в API создаёт spans, `BatchSpanProcessor` передаёт их
+в фоне через OTLP/HTTP на `http://alloy:4318/v1/traces`.
+Alloy объединяет данные в пакеты и отправляет через OTLP/gRPC на `tempo:4317`.
+Tempo работает в режиме `-target=all` и сохраняет данные в томе `tempo-data`.
+Файл настройки — `tempo/config.yml`. Grafana использует HTTP API `tempo:3200`.
+
+FastAPI instrumentation создаёт серверный HTTP span. Служебные URL,
+совпадающие с `/metrics` и `/health`, а также технические ASGI send/receive
+spans исключены. Для `GET /tasks` вручную добавлены дочерние spans:
+
+```text
+task-api: GET /tasks            SERVER
+├── db.connect                 CLIENT — получение соединения
+└── db.query.tasks             CLIENT — SQL и получение результата
+```
+
+HTTP span включает дочерние операции: складывать его длительность
+с длительностями детей нельзя. DB spans измеряются в процессе API,
+а не внутри PostgreSQL. Другие маршруты задач имеют HTTP spans,
+но отдельных DB spans для них пока нет.
+
+В **Explore → Tempo → TraceQL**:
+
+```traceql
+{ resource.service.name = "task-api" }
+```
+
+При поиске нового запроса учитывать фоновую отправку spans — она может
+занять несколько секунд. Успешный span может иметь статус `unset`;
+HTTP-статус смотреть в атрибутах. Исключение, покинувшее ручной блок span,
+записывается как событие `exception` и отмечает этот span ошибочным.
+
+Сэмплер в приложении явно не переопределён, политики head/tail sampling
+в Alloy не настроены. Практика sampling пропущена. Для обычных запросов
+без входящего родительского контекста используется стандартный режим SDK
+с записью всех новых traces; входящее решение родителя учитывается.
+
+### Переходы между логами и traces
+
+В `grafana/datasources.yml` настроены оба направления:
+
+1. В Loki раскрыть JSON-запись, при необходимости свернуть **Log line**,
+   найти дополнительное поле **TraceID** и нажать **Open trace**.
+2. В Tempo выбрать span и нажать **Logs for this trace**.
+
+Для обратного перехода Grafana сопоставляет `service.name` из span/resource
+с label Loki `service_name`, фильтрует по Trace ID и расширяет временной
+интервал на минуту в обе стороны. Фильтр по Span ID выключен,
+поэтому видны записи всего trace. **Log context** в Loki показывает
+соседние записи и не является переходом в Tempo.
+
+`trace_context_fields()` добавляет контекст в JSON; `request_id` и `trace_id`
+выполняют разные задачи и не обязаны совпадать. Derived field создаёт
+ссылку, но не сам trace. Отсутствующий, ещё не доставленный или удалённый
+trace по такой ссылке не откроется.
+
+### Передача контекста от клиента
+
+`tests/tracing/client.py` запускает одноразовый HTTP-клиент с именем сервиса
+`lab-client`. Он создаёт CLIENT span, через `inject(headers)` передаёт
+контекст в заголовке `traceparent` и отправляет свой span через Alloy.
+Инструментация FastAPI извлекает входящий контекст, связывая операции API
+с клиентским span.
+
+При работающих API, БД, Alloy и Tempo:
+
+```bash
+docker compose exec -T api python < tests/tracing/client.py
+```
+
+Файл передаётся через stdin отдельному процессу в контейнере; дополнительных
+зависимостей или bind mounts для него не требуется. Команда выводит
+`traceparent`, Trace ID и HTTP-статус. Найти напечатанный ID в Tempo.
+Ожидаются два имени сервисов, четыре spans и один общий Trace ID:
+
+```text
+lab-client: GET task-api
+└── task-api: GET /tasks
+    ├── db.connect
+    └── db.query.tasks
+```
+
+PostgreSQL здесь не является третьим инструментированным сервисом.
+
 ## Конфигурация Grafana в Git
 
-- `grafana/datasources.yml` — источник Prometheus с фиксированным UID
-  `PBFA97CFB590B2093` и интервалом сбора `5s`.
+- `grafana/datasources.yml` — источники Prometheus (UID `PBFA97CFB590B2093`,
+  интервал сбора `5s`), Loki (UID `loki`) и Tempo (UID `tempo`),
+  а также ссылки между логами и traces.
 - `grafana/dashboards.yml` — загрузчик файлов дашбордов.
 - `grafana/dashboards/overview.json` — дашборд `Task API`, 14 панелей,
-  экспорт в формате Grafana V2 Resource, совместимый с используемой Grafana 13.2.4.
+  экспорт в формате Grafana V2 Resource, проверенный с Grafana 13.2.4.
+  Панель HTTP 5xx из Loki, добавленная в UI, пока не входит в этот файл.
 
 Изменения через UI разрешены, но не записываются обратно в JSON автоматически.
 После редактирования сохранить дашборд, экспортировать его как V2 Resource JSON
@@ -150,6 +385,11 @@ histogram_quantile(0.95,
 последующем обновлении имеет приоритет над сохранёнными в UI изменениями.
 Проверка файлов выполняется каждые 30 секунд. При удалении файла дашборд
 автоматически не удаляется (`disableDeletion: true`).
+После правки файла источников данных перезапустить Grafana:
+
+```bash
+docker compose restart grafana
+```
 
 ## Алерты и уведомления
 
@@ -211,8 +451,9 @@ docker compose run --rm --no-deps k6 run /scripts/spike.js
 ### Измеренные результаты
 
 Результаты одного локального запуска каждого сценария, предоставленные
-в ходе выполнения лабораторной. Это не повторные измерения и не предел
-производительности приложения.
+в ходе выполнения лабораторной до добавления JSON-логирования и tracing.
+Это не повторные измерения и не предел производительности приложения;
+накладные расходы новой инструментации этими результатами не оценены.
 
 | Сценарий | Запросы | Средний RPS | HTTP avg | HTTP p95 | Ошибки | Пропуски |
 |---|---:|---:|---:|---:|---:|---:|
@@ -231,24 +472,74 @@ docker compose run --rm --no-deps k6 run /scripts/spike.js
 Разборы отражают выполненные упражнения; исходные сырые логи k6 и полная
 история метрик в репозитории не сохранены.
 
+### Сбой БД: от лога к ошибочному span
+
+При запущенном стенде выполнить один запрос с остановленной БД и восстановить её:
+
+```bash
+docker compose stop db
+curl -i http://localhost:8001/tasks
+docker compose start db
+```
+
+Ожидается HTTP 503 с `X-Request-ID`. Найти запрос в Loki по этому ID:
+появятся `http_request` со статусом 503 и `database_error` с причиной,
+связанные общими `request_id` и `trace_id`. Нажать **Open trace**.
+
+Ожидаемая структура:
+
+```text
+GET /tasks          ERROR, HTTP 503
+└── db.connect      ERROR, событие exception
+```
+
+`db.query.tasks` отсутствует: подключение не состоялось и SQL не выполнялся.
+В выполненном эксперименте сообщение было `failed to resolve host 'db'`:
+сбой произошёл при разрешении имени, до TCP-подключения и авторизации.
+В других условиях ошибка может быть иной, например отказ подключения
+или таймаут; ориентироваться на сообщение конкретного исключения.
+
+После старта PostgreSQL проверить восстановление, повторив при необходимости
+после завершения его запуска:
+
+```bash
+curl -i http://localhost:8001/health/db
+curl -i http://localhost:8001/tasks
+```
+
+Оба запроса должны вернуть 200. При одном ошибочном запросе алерт высокой
+доли ошибок может не сработать: его правило требует трафик более 1 запроса/с.
+
 ## Версии и обновление
 
-Внешние образы в `compose.yaml` и базовый Python в Dockerfile закреплены
-по `sha256` digest из использовавшихся локальных образов. Это предотвращает
-незаметную смену содержимого тега при следующем запуске. Платформа проверки —
-linux/amd64; переносимость каждого digest на другие архитектуры не проверялась.
-Обновления выполняются явно: выбрать новый образ, проверить его digest,
-изменить ссылку и повторить необходимые проверки.
+В текущем `compose.yaml` явно указаны версии Loki `3.7.8`,
+Alloy `v1.21.0`, Tempo `3.1.0`, cAdvisor `0.60.6` и k6 `2.3.0`.
+PostgreSQL использует тег `16`, Python — `3.12-slim`; Prometheus, Grafana,
+Alertmanager и Node Exporter используют образы без явного тега.
+Образы не закреплены по digest: содержимое тегов при обновлении может измениться.
+Для воспроизводимого обновления нужно выбрать версии/digests и повторить
+проверки конфигурации и работы стенда.
 
 `requirements.txt` перечисляет прямые Python-зависимости, `constraints.txt`
-фиксирует версии текущего набора, включая `prometheus-client==0.26.0`.
-Constraints не являются lock-файлом с хешами пакетов.
+фиксирует перечисленные в нём версии, включая `prometheus-client==0.26.0`,
+OpenTelemetry SDK/exporter `1.45.1` и FastAPI instrumentation `0.66b1`.
+После добавления OpenTelemetry полный список транзитивных зависимостей
+не обновлялся. Constraints не являются lock-файлом с хешами пакетов.
 
 После изменения кода или зависимостей:
 
 ```bash
 docker compose up -d --build api
 ```
+
+Проверка совместимости установленных Python-зависимостей:
+
+```bash
+docker compose run --rm --no-deps -T api python -m pip check
+```
+
+Практические политики sampling, SLI/SLO, error budget и burn-rate alerts
+в этой версии лабораторной не реализованы.
 
 ## Остановка и данные
 
@@ -266,5 +557,6 @@ docker compose down
 Повторный запуск — `docker compose up -d`.
 В отличие от первоначального Docker-проекта тома этой лабы управляются Compose.
 `docker compose down -v` удалит данные PostgreSQL, историю Prometheus,
-хранилище Grafana и состояние Alertmanager. Файловые конфигурации и JSON
-дашборда останутся, но не заменяют резервную копию данных.
+хранилище Grafana, состояние Alertmanager, логи Loki, данные Tempo
+и позиции чтения Alloy. Файловые конфигурации и JSON дашборда останутся,
+но не заменяют резервную копию данных.

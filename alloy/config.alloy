@@ -1,0 +1,56 @@
+discovery.docker "api" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+
+  filter {
+    name = "label"
+    values = [
+      "com.docker.compose.project=observability-lab",
+      "com.docker.compose.service=api",
+    ]
+  }
+}
+
+loki.source.docker "api" {
+  host    = "unix:///var/run/docker.sock"
+  targets = discovery.docker.api.targets
+
+  labels = {
+    service_name = "task-api",
+    environment  = "lab",
+  }
+
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
+
+otelcol.receiver.otlp "api" {
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+
+  output {
+    traces = [otelcol.processor.batch.traces.input]
+  }
+}
+
+otelcol.processor.batch "traces" {
+  output {
+    traces = [otelcol.exporter.otlp.tempo.input]
+  }
+}
+
+otelcol.exporter.otlp "tempo" {
+  client {
+    endpoint = "tempo:4317"
+
+    tls {
+      insecure = true
+    }
+  }
+}
